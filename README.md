@@ -231,6 +231,92 @@ You will typically use these files for reporting:
 - Missing checkpoints on evaluation cells:
 	- Run training cells/scripts first, then rerun evaluation cells.
 
+## Phase 2: Adaptive Universal Transformer (UT + ACT)
+
+Based on Zhou et al., *"Semantic Communication with Adaptive Universal Transformer"* (arXiv:2108.09119),
+with the SBERT semantic-similarity metric from Lee et al., *"seq2seq-SC"* (arXiv:2210.15237).
+
+### What is new compared to Phase 1
+
+| | Phase 1 | Phase 2 |
+|---|---|---|
+| Semantic encoder/decoder | Fixed-depth Transformer (4 layers) | One shared Transformer block applied recurrently, depth chosen per token by ACT (max `m = 5`, threshold `T = 0.9`) |
+| Channel | AWGN | AWGN **and Rayleigh block fading** (perfect CSI, zero-forcing) |
+| Metrics | BLEU-1..4 | BLEU-1..4 **+ SBERT semantic similarity**, exact match |
+| Compute analysis | none | average ACT steps per token, layer passes, ms / sentence |
+
+Our extensions beyond the paper:
+
+1. **SNR-aware halting** (`--model ut_snr`): the ACT halting unit also receives the channel SNR, so the
+   model can choose how many steps to spend based on channel quality. In the original paper the halting
+   unit never sees the SNR.
+2. **Compute-vs-accuracy study**: layer passes and decode time are compared against fixed-depth DeepSC
+   (`ut_compare_compute.csv`).
+3. **Generalisation to unseen text** (`--ood_text file.txt`): evaluate on sentences from a different domain
+   (e.g. Flickr captions), reporting the out-of-vocabulary rate.
+4. **BLEU vs SBERT analysis**: `ut_compare_semantic_wins.csv` lists sentences whose words changed
+   (low BLEU) but whose meaning survived (high SBERT).
+
+### New files
+
+- `ut_model.py`: ACT halting (paper Algorithm 1), `UTSemCom` model, AWGN/Rayleigh channels, `DeepSCWrapper`
+  (existing DeepSC with the same interface + Rayleigh support)
+- `semantic_metrics.py`: SBERT cosine similarity (falls back to NaN if the model cannot be loaded)
+- `ut_experiment.py`: train + evaluate one model on one channel
+- `compare_ut_results.py`: combines all runs into report plots/tables
+- `requirements.txt`
+
+`ut_experiment.py` reads the same `deepsc_replication_config.json` (data paths, `d_model`, batch size,
+learning rate, SNR ranges) so all models use identical data. If that file is missing it uses built-in
+defaults that match this README.
+
+### Run
+
+```powershell
+pip install -r requirements.txt
+
+# Baseline, paper model, and our extension, on both channels
+python ut_experiment.py --model deepsc --channel awgn
+python ut_experiment.py --model ut     --channel awgn
+python ut_experiment.py --model ut_snr --channel awgn
+python ut_experiment.py --model deepsc --channel rayleigh
+python ut_experiment.py --model ut     --channel rayleigh
+python ut_experiment.py --model ut_snr --channel rayleigh
+
+# Optional: unseen-domain test on an existing checkpoint
+python ut_experiment.py --model ut --channel awgn --skip_train --ood_text flickr_captions.txt
+
+# Combine everything
+python compare_ut_results.py
+```
+
+Useful flags: `--epochs`, `--max_train_sentences 100000` (quick runs), `--max_eval_sentences 2000`,
+`--num_layers 3` (DeepSC depth used in the paper), `--max_steps`, `--act_threshold`, `--ponder_weight`,
+`--train_snr_min/--train_snr_max`, `--eval_snrs`, `--no_sbert`.
+
+### Outputs (prefix `<model>_<channel>`, e.g. `ut_snr_rayleigh`)
+
+- `<prefix>_best.pt`, `<prefix>_train_history.csv`
+- `<prefix>_results_latest.csv/.json`: all metrics per SNR. The JSON keeps the `bleu_by_snr` format, so
+  these files can also be added to `compare_results.ipynb`.
+- `<prefix>_examples.csv`: per-sentence reference / received text with BLEU, SBERT and ACT steps
+- `<prefix>_bleu_sbert_snr.png`, `<prefix>_steps_snr.png`
+- `ut_compare_*.png/.csv` from `compare_ut_results.py`
+
+### Implementation notes
+
+- **Ponder cost weight.** The paper writes `L = L_CE + rho`. With `m = 5`, an unweighted `rho` (about 2 to 5)
+  can be much larger than the cross-entropy and push the model toward halting too early, so we use `L = L_CE + w * rho`
+  with `w = 0.01` by default (`--ponder_weight 1.0` reproduces the paper exactly).
+- **Learning rate.** The paper reports 1e-6, which is very slow to train; we use the shared config's rate.
+- **Baseline depth.** The paper's Transformer baseline uses 3 layers; Phase 1 DeepSC uses 4. Use
+  `--num_layers 3` for a paper-matched comparison, and state which one is reported.
+- **Rayleigh channel.** Channel symbols are grouped into I/Q pairs (`channel_dim = 16` gives 8 complex symbols
+  per word). One gain `h ~ CN(0,1)` is drawn per sentence and the receiver equalises with perfect CSI.
+- **Training SNR.** A new SNR is drawn uniformly for every batch from the configured range. For Rayleigh a
+  wider range (e.g. `--train_snr_min 0 --train_snr_max 20`) usually helps.
+- **Decoding** is batched greedy decoding for all three models, so timings are comparable.
+
 ## Next Extensions
 
 - Add a `requirements.txt` or `environment.yml` for exact dependency pinning
